@@ -1,0 +1,69 @@
+name: Fight Reel Pipeline
+
+# HOW IT RUNS
+#   - Manual: Actions tab -> "Fight Reel Pipeline" -> Run workflow -> paste footage URL
+#   - Scheduled: uncomment the cron block below to run weekly
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Public URL to the raw footage (Drive/R2/any direct link)"
+        required: true
+      max_clips:
+        description: "Max highlights in the reel"
+        required: false
+        default: "6"
+  # schedule:
+  #   - cron: "0 3 * * 1"   # every Monday 03:00 UTC
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # JOB 1 - BUILD: runs automatically, produces reel.mp4 as a downloadable artifact
+  # ---------------------------------------------------------------------------
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg + font
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Download raw footage
+        run: curl -L "${{ inputs.video_url }}" -o raw.mp4
+
+      # --- MODULE 2 (not built yet): OpenAI frame-sample analyzer -> moments.json ---
+      - name: Analyze footage (OpenAI)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python3 analyzer.py --video raw.mp4 --out moments.json
+
+      # --- MODULE 1 (built + verified): cut & stitch the reel ---
+      - name: Edit reel
+        run: >
+          python3 reel_editor.py
+          --video raw.mp4
+          --analysis moments.json
+          --out reel.mp4
+          --max-clips ${{ inputs.max_clips }}
+
+      - name: Upload reel for review
+        uses: actions/upload-artifact@v4
+        with:
+          name: reel
+          path: |
+            reel.mp4
+            reel.mp4.caption.txt
+          retention-days: 7
+
+  # Instagram publishing (R2 upload -> IG container -> media_publish) will be
+  # added here as a second job once the reels look right on real footage.
