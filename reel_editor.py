@@ -190,8 +190,12 @@ def normalize_clip(video, moment, idx, gate, tmpdir, captions,
     return out, dur
 
 
-def stitch(clips, durs, transition, trans_dur, out):
-    """Chain xfade (video) + acrossfade (audio) across all clips."""
+def stitch(clips, durs, transition, trans_dur, out, per_cut=None):
+    """Chain xfade (video) + acrossfade (audio) across all clips.
+
+    per_cut, when given, supplies the transition for each cut individually
+    (per_cut[i] is the cut INTO clip i), so the edit can vary its rhythm.
+    """
     if len(clips) == 1:
         run(["ffmpeg", "-y", "-i", clips[0], "-c", "copy", out])
         return
@@ -207,8 +211,9 @@ def stitch(clips, durs, transition, trans_dur, out):
         offset = cum - trans_dur          # start the overlap trans_dur early
         vlab = f"[v{i}]"
         alab = f"[a{i}]"
+        tr = per_cut[i] if per_cut and i < len(per_cut) and per_cut[i] else transition
         v_parts.append(
-            f"{prev_v}[{i}:v]xfade=transition={transition}:"
+            f"{prev_v}[{i}:v]xfade=transition={tr}:"
             f"duration={trans_dur}:offset={offset:.3f}{vlab}"
         )
         a_parts.append(f"{prev_a}[{i}:a]acrossfade=d={trans_dur}{alab}")
@@ -242,6 +247,9 @@ def main():
     ap.add_argument("--pad-end", type=float, default=1.5,
                     help="seconds added AFTER each clip's end - the model tends "
                          "to cut before the finish, so this is the important one")
+    ap.add_argument("--edl", default=None,
+                    help="edit decision list from editor_agent.py. Overrides "
+                         "selection, order, per-clip padding and transitions.")
     ap.add_argument("--no-captions", action="store_true")
     args = ap.parse_args()
 
@@ -251,8 +259,27 @@ def main():
     if not moments:
         raise SystemExit("No moments in analysis JSON.")
 
-    picked, total = select_moments(moments, args.max_clips, args.trans_dur,
-                                   pad_total=args.pad_start + args.pad_end)
+    edl_clips = None
+    if args.edl:
+        with open(args.edl) as fh:
+            edl_data = json.load(fh)
+        edl_clips = []
+        for c in edl_data.get("clips", []):
+            i = int(c["index"])
+            if 0 <= i < len(moments):
+                edl_clips.append(c)
+        if not edl_clips:
+            raise SystemExit("EDL contained no valid clip indexes.")
+        picked = [moments[c["index"]] for c in edl_clips]
+        total = sum(parse_ts(m["end_time"]) - parse_ts(m["start_time"])
+                    + c["pad_start"] + c["pad_end"]
+                    for m, c in zip(picked, edl_clips))
+        total -= max(0, len(picked) - 1) * args.trans_dur
+        if edl_data.get("reasoning"):
+            print(f"Editor: {edl_data['reasoning']}\n")
+    else:
+        picked, total = select_moments(moments, args.max_clips, args.trans_dur,
+                                       pad_total=args.pad_start + args.pad_end)
     print(f"Selected {len(picked)} clip(s), ~{total:.1f}s reel:")
     for m in picked:
         print(f"  score {m.get('visual_score')}  "
@@ -269,14 +296,17 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         clips, durs = [], []
         for i, m in enumerate(picked):
+            ps = edl_clips[i]["pad_start"] if edl_clips else args.pad_start
+            pe = edl_clips[i]["pad_end"] if edl_clips else args.pad_end
             c, d = normalize_clip(args.video, m, i, args.gate, tmp,
                                   not args.no_captions,
-                                  pad_start=args.pad_start,
-                                  pad_end=args.pad_end,
+                                  pad_start=ps,
+                                  pad_end=pe,
                                   src_dur=src_dur)
             clips.append(c)
             durs.append(d)
-        stitch(clips, durs, args.transition, args.trans_dur, args.out)
+        per_cut = [c.get("transition") for c in edl_clips] if edl_clips else None
+        stitch(clips, durs, args.transition, args.trans_dur, args.out, per_cut)
 
     # Instagram post caption (emoji kept) -> sidecar for the publish stage.
     lines = [post_caption(m, args.gate) for m in picked]
