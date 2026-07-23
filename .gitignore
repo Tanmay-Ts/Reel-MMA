@@ -1,0 +1,7 @@
+clips/
+work/
+*.mp4
+*.MOV
+*.mov
+moments.json
+*.caption.txt

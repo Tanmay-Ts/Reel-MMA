@@ -80,6 +80,19 @@ def run(cmd):
     return p
 
 
+def source_duration(video):
+    """Length of the source video, so end-padding can't run past the end."""
+    p = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nokey=1:noprint_wrappers=1", video],
+        capture_output=True, text=True,
+    )
+    try:
+        return float(p.stdout.strip())
+    except ValueError:
+        return None
+
+
 def burned_label(moment: dict, gate: float) -> str:
     """Confidence gate: specific technique name only when the model is sure."""
     conf = float(moment.get("technique_confidence", 0) or 0)
@@ -98,7 +111,7 @@ def post_caption(moment: dict, gate: float) -> str:
     return moment.get("caption_generic") or ""
 
 
-def select_moments(moments, max_clips, trans_dur):
+def select_moments(moments, max_clips, trans_dur, pad_total=0.0):
     """Rank by visual_score, then trim the tail so the montage fits under 90s."""
     ranked = sorted(
         moments, key=lambda m: float(m.get("visual_score", 0) or 0), reverse=True
@@ -106,7 +119,8 @@ def select_moments(moments, max_clips, trans_dur):
     ranked = ranked[:max_clips]
 
     def total(ms):
-        raw = sum(parse_ts(m["end_time"]) - parse_ts(m["start_time"]) for m in ms)
+        raw = sum(parse_ts(m["end_time"]) - parse_ts(m["start_time"]) + pad_total
+                  for m in ms)
         # each transition overlaps two clips, shaving trans_dur off the total
         return raw - max(0, len(ms) - 1) * trans_dur
 
@@ -115,16 +129,39 @@ def select_moments(moments, max_clips, trans_dur):
     return ranked, total(ranked)
 
 
-def normalize_clip(video, moment, idx, gate, tmpdir, captions):
-    """Cut one moment and force it to the canonical format for stitching."""
-    start = parse_ts(moment["start_time"])
-    end = parse_ts(moment["end_time"])
+def normalize_clip(video, moment, idx, gate, tmpdir, captions,
+                   pad_start=0.0, pad_end=0.0, src_dur=None):
+    """Cut one moment and force it to the canonical format for stitching.
+
+    pad_start / pad_end extend the cut outward. The model tends to mark a
+    technique 'done' at the point of commitment, before the landing or the
+    finish, so pad_end matters most - without it a throw shows the entry and
+    loses the payoff.
+    """
+    start = max(0.0, parse_ts(moment["start_time"]) - pad_start)
+    end = parse_ts(moment["end_time"]) + pad_end
+    if src_dur is not None:
+        end = min(end, src_dur)
+    if end <= start:
+        end = start + 0.5
     dur = max(0.1, end - start)
     out = os.path.join(tmpdir, f"clip_{idx:02d}.mp4")
 
+    # Where to place the 9:16 crop window. Landscape footage loses most of its
+    # width in a vertical crop, so a blind centre-crop can cut the action out
+    # entirely when it happens at the side of the mat. subject_x (0=left,
+    # 0.5=centre, 1=right) comes from the analyzer and aims the crop.
+    sx = moment.get("subject_x", 0.5)
+    try:
+        sx = float(sx)
+    except (TypeError, ValueError):
+        sx = 0.5
+    sx = min(1.0, max(0.0, sx))
+
     vf = (
         f"scale={W}:{H}:force_original_aspect_ratio=increase,"
-        f"crop={W}:{H},fps={FPS},format=yuv420p,setsar=1"
+        f"crop={W}:{H}:(in_w-{W})*{sx:.3f}:(in_h-{H})/2,"
+        f"fps={FPS},format=yuv420p,setsar=1"
     )
 
     if captions:
@@ -200,6 +237,11 @@ def main():
     ap.add_argument("--transition", default="smoothleft",
                     help="xfade style: smoothleft, slideleft, fade, circleopen, wiperight ...")
     ap.add_argument("--trans-dur", type=float, default=0.4)
+    ap.add_argument("--pad-start", type=float, default=0.5,
+                    help="seconds added BEFORE each clip's start")
+    ap.add_argument("--pad-end", type=float, default=1.5,
+                    help="seconds added AFTER each clip's end - the model tends "
+                         "to cut before the finish, so this is the important one")
     ap.add_argument("--no-captions", action="store_true")
     args = ap.parse_args()
 
@@ -209,7 +251,8 @@ def main():
     if not moments:
         raise SystemExit("No moments in analysis JSON.")
 
-    picked, total = select_moments(moments, args.max_clips, args.trans_dur)
+    picked, total = select_moments(moments, args.max_clips, args.trans_dur,
+                                   pad_total=args.pad_start + args.pad_end)
     print(f"Selected {len(picked)} clip(s), ~{total:.1f}s reel:")
     for m in picked:
         print(f"  score {m.get('visual_score')}  "
@@ -222,11 +265,15 @@ def main():
     if total < REELS_MIN:
         print(f"  ! only {total:.1f}s (<5s); may not land in the Reels tab")
 
+    src_dur = source_duration(args.video)
     with tempfile.TemporaryDirectory() as tmp:
         clips, durs = [], []
         for i, m in enumerate(picked):
             c, d = normalize_clip(args.video, m, i, args.gate, tmp,
-                                  not args.no_captions)
+                                  not args.no_captions,
+                                  pad_start=args.pad_start,
+                                  pad_end=args.pad_end,
+                                  src_dur=src_dur)
             clips.append(c)
             durs.append(d)
         stitch(clips, durs, args.transition, args.trans_dur, args.out)

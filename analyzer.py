@@ -53,29 +53,58 @@ candidate window of training, sparring, or match footage (BJJ, wrestling, judo,
 Muay Thai, boxing, or MMA). The frames are given in time order, each labelled
 with its timestamp in seconds.
 
-Find every distinct highlight-worthy action moment in this window. Prioritise:
-takedowns, throws, sweeps, submissions, submission escapes, scrambles, dynamic
-position changes, head/high kicks, knees, elbows, spinning attacks, clean
-combinations, knockdowns, and clearly landed strikes. Ignore resets, standing
-around, coaching, and dead time.
+Find every distinct highlight-worthy action moment in this window. Three kinds
+of moment qualify:
+
+FIGHT ACTION: takedowns, throws, sweeps, submissions, submission escapes,
+scrambles, dynamic position changes, head/high kicks, knees, elbows, spinning
+attacks, clean combinations, knockdowns, and clearly landed strikes.
+
+DEFENCE AND ATTEMPTS COUNT TOO. A takedown does NOT have to succeed to be
+highlight-worthy. Actively include: sprawls, stuffed or defended takedowns,
+failed but explosive shots, guard retention, scrambles where neither side
+clearly wins, reversals, and hard-fought exchanges. A well-defended takedown
+attempt is as good a highlight as a completed one. Do not discard a moment
+merely because the attack did not finish.
+
+CONDITIONING / ATHLETICISM: visually intense training effort - fast rope climbs,
+explosive sprints, plyometrics and box jumps, heavy bag work with visible
+impact, pad work with visible impact, tyre flips, sled pushes, battle ropes,
+heavy lifts, burpees and other high-intensity conditioning. Judge these on
+EFFORT AND INTENSITY made visible: speed, power, explosiveness, strain, full
+range of motion. A fast committed rope climb is highlight-worthy; someone
+resting on the rope or moving slowly is not.
+
+Ignore: resets, standing around, coaching, stretching, walking, water breaks,
+and low-effort or half-hearted movement of any kind.
 
 For striking, prioritise CLEAN, VISIBLE strikes that clearly land or nearly land
-with visible impact or reaction. A wild swing that misses is not highlight-worthy
-unless visually spectacular (e.g. a spinning attack).
+with visible impact or reaction. A wild swing at empty air is NOT highlight-worthy
+(shadowboxing and air-punching should be ignored) unless visually spectacular
+(e.g. a spinning attack). Bag work and pad work DO count, because the impact is
+visible and audible.
 
 For EACH moment return an object with:
 - start_time, end_time: tightest window in seconds (numbers), inside the frame
   timestamps you were given, from just before the action to just after it resolves.
 - visual_score: integer 1-10 for how visually impressive / reel-worthy it is.
 - action_type: one of takedown, throw, sweep, submission, escape, scramble,
-  strike, kick, knee, combination, knockdown, other.
-- technique_guess: best specific guess (e.g. "double leg takedown", "head kick",
-  "armbar"), or "uncertain".
+  strike, kick, knee, combination, knockdown, bagwork, padwork,
+  rope_climb, conditioning, strength, other.
+- technique_guess: best specific guess. For fight action name the technique
+  (e.g. "double leg takedown", "head kick", "armbar"). For conditioning name
+  the movement (e.g. "rope climb", "box jump", "tyre flip", "heavy bag work").
+  Use "uncertain" if you cannot tell.
 - technique_confidence: 0.0-1.0, honest and conservative. Tangled bodies, blur,
   or occlusion lower it. Only 0.8+ when the technique is unambiguous and clear.
 - caption_specific: short punchy caption that NAMES the technique (for high conf).
 - caption_generic: short punchy caption that does NOT name a technique (for low conf).
 - description: one plain sentence of what physically happens.
+- subject_x: decimal 0.0-1.0 giving where the ACTION sits horizontally in the
+  frame across this moment. 0.0 = hard left edge, 0.5 = centre, 1.0 = hard
+  right edge. This is used to decide where to crop for a vertical 9:16 reel,
+  so report where the fighters actually are, not where the frame centre is.
+  If the action moves, give the position where the key moment happens.
 
 Rules:
 - Judge on merit. If this window has nothing worthy, return an empty list.
@@ -155,12 +184,22 @@ def norm(x):
 
 
 def find_windows(frames, video, duration, sensitivity, max_windows,
-                 motion_w=0.6, audio_w=0.4, pad=1.0, min_dur=2.0, merge_gap=1.5):
-    """Combine motion + audio, threshold, and merge hot spots into windows."""
+                 motion_w=0.5, audio_w=0.5, combine="max",
+                 pad=1.0, min_dur=2.0, merge_gap=1.5):
+    """Combine motion + audio, threshold, and merge hot spots into windows.
+
+    combine="sum": weighted blend (takedown-friendly; big motion dominates).
+    combine="max": hot if EITHER channel is hot on its own - this is what lets
+                   striking through, since a landed strike is loud (audio-hot)
+                   without being a big whole-body motion spike.
+    """
     ts = np.array([t for t, _ in frames])
     motion = norm(motion_series(frames))
     audio = norm(audio_series(video, len(frames), duration))
-    combined = motion_w * motion + audio_w * audio
+    if combine == "max":
+        combined = np.maximum(motion, audio)
+    else:
+        combined = motion_w * motion + audio_w * audio
 
     thresh = combined.mean() + sensitivity * combined.std()
     hot = combined >= thresh
@@ -202,6 +241,31 @@ def find_windows(frames, video, duration, sensitivity, max_windows,
     return [(round(s, 2), round(e, 2)) for s, e, _ in merged]
 
 
+def chunk_windows(windows, max_dur, overlap=1.0):
+    """Split long windows into shorter chunks.
+
+    A long window sampled with a fixed frame budget gets terrible time
+    resolution - a 26s window at 12 frames is one frame every ~2.2s, and a
+    takedown that takes 1.5s falls entirely between frames. Chunking gives
+    every chunk the FULL frame budget, so the model actually sees the action.
+    Chunks overlap slightly so an action straddling a boundary isn't lost.
+    """
+    out = []
+    for s, e in windows:
+        dur = e - s
+        if dur <= max_dur:
+            out.append((s, e))
+            continue
+        cur = s
+        while cur < e:
+            nxt = min(e, cur + max_dur)
+            out.append((round(cur, 2), round(nxt, 2)))
+            if nxt >= e:
+                break
+            cur = nxt - overlap
+    return out
+
+
 def frames_in_window(frames, start, end, cap, width):
     """Pick up to `cap` frames inside [start,end], evenly spaced, downscaled."""
     inside = [(t, p) for t, p in frames if start <= t <= end]
@@ -221,8 +285,15 @@ def frames_in_window(frames, start, end, cap, width):
     return out
 
 
-def analyze_window(client, model, detail, wframes, wstart, wend):
+def analyze_window(client, model, detail, wframes, wstart, wend, context=None):
     """One GPT-4o call: timestamped frames in, list of moments out."""
+    system = SYSTEM_PROMPT
+    if context:
+        system += (
+            "\n\nSESSION CONTEXT FROM THE USER (this describes what THIS "
+            "particular set of footage contains - trust it and adapt what you "
+            "treat as highlight-worthy accordingly):\n" + context.strip() + "\n"
+        )
     content = [{
         "type": "text",
         "text": (f"Frames from a candidate window spanning {wstart:.1f}s to "
@@ -240,7 +311,7 @@ def analyze_window(client, model, detail, wframes, wstart, wend):
         temperature=0.2,
         response_format={"type": "json_object"},
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system},
             {"role": "user", "content": content},
         ],
     )
@@ -265,14 +336,34 @@ def main():
     ap.add_argument("--out", default="moments.json")
     ap.add_argument("--model", default="gpt-4o")
     ap.add_argument("--sample-fps", type=float, default=1.0)
-    ap.add_argument("--frames-per-window", type=int, default=12)
+    ap.add_argument("--frames-per-window", type=int, default=20)
+    ap.add_argument("--max-window-dur", type=float, default=8.0,
+                    help="split candidate windows longer than this into chunks "
+                         "so each chunk gets the full frame budget")
     ap.add_argument("--frame-width", type=int, default=768)
     ap.add_argument("--detail", default="high", choices=["high", "low", "auto"])
     ap.add_argument("--sensitivity", type=float, default=0.5)
+    ap.add_argument("--combine", choices=["max", "sum"], default="max",
+                    help="max = fire if motion OR audio is hot (catches striking); "
+                         "sum = weighted blend (motion-dominant, takedown-friendly)")
+    ap.add_argument("--motion-weight", type=float, default=0.5)
+    ap.add_argument("--audio-weight", type=float, default=0.5)
     ap.add_argument("--max-windows", type=int, default=20)
+    ap.add_argument("--context", default=None,
+                    help="describe THIS set of footage so the model adapts, e.g. "
+                         "\"medal ceremony and drill games, no sparring\"")
+    ap.add_argument("--context-file", default=None,
+                    help="read the session context from a text file instead")
     ap.add_argument("--dry-run", action="store_true",
                     help="skip GPT-4o; emit one stub moment per window")
     args = ap.parse_args()
+
+    context = args.context
+    if args.context_file:
+        with open(args.context_file) as fh:
+            context = fh.read()
+    if context:
+        print(f"Session context: {context.strip()[:120]}")
 
     duration = video_duration(args.video)
     print(f"Video: {duration:.1f}s")
@@ -282,9 +373,16 @@ def main():
         print(f"Stage 1: sampled {len(frames)} frames @ {args.sample_fps} fps")
 
         windows = find_windows(frames, args.video, duration,
-                               args.sensitivity, args.max_windows)
+                               args.sensitivity, args.max_windows,
+                               motion_w=args.motion_weight,
+                               audio_w=args.audio_weight,
+                               combine=args.combine)
         print(f"Stage 1: {len(windows)} candidate window(s): "
               + ", ".join(f"{s:.0f}-{e:.0f}s" for s, e in windows))
+
+        windows = chunk_windows(windows, args.max_window_dur)
+        print(f"Stage 1: split into {len(windows)} chunk(s) of "
+              f"<= {args.max_window_dur:.0f}s for analysis")
 
         client = None
         if not args.dry_run:
@@ -307,9 +405,12 @@ def main():
                 }]
             else:
                 print(f"  GPT-4o window {i+1}/{len(windows)} "
-                      f"({ws:.0f}-{we:.0f}s, {len(wframes)} frames)")
+                      f"({ws:.0f}-{we:.0f}s, {len(wframes)} frames, "
+                      f"1 frame per {(we-ws)/max(1,len(wframes)):.1f}s)")
                 found = analyze_window(client, args.model, args.detail,
-                                       wframes, ws, we)
+                                       wframes, ws, we, context=context)
+                print(f"      -> {len(found)} moment(s)"
+                      + ("" if found else "   [nothing found here]"))
             moments.extend(found)
 
     # normalise timestamps to mm:ss.ms strings for the editor, sort by score
