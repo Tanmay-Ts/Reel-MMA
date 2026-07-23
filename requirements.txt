@@ -1,6 +1,8 @@
-# Module 1 (reel_editor.py): no third-party deps - stdlib + ffmpeg only.
+# Module 1 (reel_editor.py): stdlib + ffmpeg only.
 # Module 2 (analyzer.py):
+numpy>=1.26.0
+pillow>=10.0.0
 openai>=1.40.0
-# Module 3 (publish.py):
-requests>=2.31.0
+# R2 sync (r2_sync.py) and the future publish step:
 boto3>=1.34.0
+requests>=2.31.0
