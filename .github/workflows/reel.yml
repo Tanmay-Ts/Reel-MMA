@@ -1,28 +1,37 @@
 name: Fight Reel Pipeline
 
-# HOW IT RUNS
-#   - Manual: Actions tab -> "Fight Reel Pipeline" -> Run workflow -> paste footage URL
-#   - Scheduled: uncomment the cron block below to run weekly
+# Polls the R2 bucket for sessions that have footage but no reel yet, and
+# processes every one of them. Drop clips (and an optional context.txt) into
+# incoming/<session>/ and the finished reel appears in outgoing/<session>/.
 on:
+  schedule:
+    - cron: "0 */6 * * *"     # every 6 hours
   workflow_dispatch:
     inputs:
-      video_url:
-        description: "Public URL to the raw footage (Drive/R2/any direct link)"
-        required: true
+      folder:
+        description: "Process only this session folder (blank = all pending)"
+        required: false
+      sample_fps:
+        description: "Analyzer sampling rate"
+        required: false
+        default: "4"
       max_clips:
-        description: "Max highlights in the reel"
+        description: "Max highlights per reel"
         required: false
         default: "6"
-  # schedule:
-  #   - cron: "0 3 * * 1"   # every Monday 03:00 UTC
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # JOB 1 - BUILD: runs automatically, produces reel.mp4 as a downloadable artifact
-  # ---------------------------------------------------------------------------
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+      R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
+      R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      SAMPLE_FPS: ${{ inputs.sample_fps || '4' }}
+      MAX_CLIPS: ${{ inputs.max_clips || '6' }}
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -38,32 +47,70 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Download raw footage
-        run: curl -L "${{ inputs.video_url }}" -o raw.mp4
+      - name: Find pending sessions
+        id: find
+        run: |
+          if [ -n "${{ inputs.folder }}" ]; then
+            echo "${{ inputs.folder }}" > pending.txt
+          else
+            python3 r2_sync.py pending > pending.txt
+          fi
+          echo "Pending sessions:"; cat pending.txt
+          echo "count=$(grep -c . pending.txt || true)" >> "$GITHUB_OUTPUT"
 
-      # --- MODULE 2 (not built yet): OpenAI frame-sample analyzer -> moments.json ---
-      - name: Analyze footage (OpenAI)
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        run: python3 analyzer.py --video raw.mp4 --out moments.json
+      - name: Process every pending session
+        if: steps.find.outputs.count != '0'
+        run: |
+          set -u
+          FAILED=""
+          while read -r SESSION; do
+            [ -z "$SESSION" ] && continue
+            echo "::group::Session $SESSION"
+            rm -rf work && mkdir -p work
 
-      # --- MODULE 1 (built + verified): cut & stitch the reel ---
-      - name: Edit reel
-        run: >
-          python3 reel_editor.py
-          --video raw.mp4
-          --analysis moments.json
-          --out reel.mp4
-          --max-clips ${{ inputs.max_clips }}
+            if ! python3 r2_sync.py download "$SESSION" --dest work; then
+              echo "download failed"; FAILED="$FAILED $SESSION"; echo "::endgroup::"; continue
+            fi
 
-      - name: Upload reel for review
-        uses: actions/upload-artifact@v4
-        with:
-          name: reel
-          path: |
-            reel.mp4
-            reel.mp4.caption.txt
-          retention-days: 7
+            # optional per-session prompt dropped in the bucket with the clips
+            CTX=""
+            if [ -f work/context.txt ]; then
+              CTX="--context-file work/context.txt"
+            fi
 
-  # Instagram publishing (R2 upload -> IG container -> media_publish) will be
-  # added here as a second job once the reels look right on real footage.
+            if ! python3 batch_concat.py --dir work/clips --out work/combined.mp4; then
+              echo "concat failed"; FAILED="$FAILED $SESSION"; echo "::endgroup::"; continue
+            fi
+
+            if ! python3 analyzer.py --video work/combined.mp4 \
+                 --out work/moments.json --model gpt-4o --combine max \
+                 --sample-fps "$SAMPLE_FPS" $CTX; then
+              echo "analyze failed"; FAILED="$FAILED $SESSION"; echo "::endgroup::"; continue
+            fi
+
+            if ! python3 reel_editor.py --video work/combined.mp4 \
+                 --analysis work/moments.json --out work/reel.mp4 \
+                 --max-clips "$MAX_CLIPS"; then
+              echo "edit failed"; FAILED="$FAILED $SESSION"; echo "::endgroup::"; continue
+            fi
+
+            if ! python3 r2_sync.py upload "$SESSION" \
+                 --reel work/reel.mp4 --caption work/reel.mp4.caption.txt; then
+              echo "upload failed"; FAILED="$FAILED $SESSION"; echo "::endgroup::"; continue
+            fi
+
+            echo "Session $SESSION done"
+            echo "::endgroup::"
+          done < pending.txt
+
+          if [ -n "$FAILED" ]; then
+            echo "Failed sessions:$FAILED"
+            exit 1
+          fi
+
+      - name: Nothing to do
+        if: steps.find.outputs.count == '0'
+        run: echo "No pending sessions in the bucket."
+
+# Instagram publishing is deliberately not here. Reels land in outgoing/ for a
+# human to review and post. Add a publish job once the output is trusted.
