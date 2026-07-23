@@ -90,7 +90,7 @@ jobs:
 
             if ! python3 reel_editor.py --video work/combined.mp4 \
                  --analysis work/moments.json --out work/reel.mp4 \
-                 --max-clips "$MAX_CLIPS"; then
+                 --max-clips "$MAX_CLIPS" --no-captions; then
               echo "edit failed"; FAILED="$FAILED $SESSION"; echo "::endgroup::"; continue
             fi
 
