@@ -5,3 +5,5 @@ work/
 *.mov
 moments.json
 *.caption.txt
+edl.json
+*.raw.json

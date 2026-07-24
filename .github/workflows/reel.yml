@@ -30,6 +30,8 @@ jobs:
       R2_ACCESS_KEY: ${{ secrets.R2_ACCESS_KEY }}
       R2_SECRET_KEY: ${{ secrets.R2_SECRET_KEY }}
       R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+      DRIVE_PARENT_FOLDER_ID: ${{ secrets.DRIVE_PARENT_FOLDER_ID }}
       SAMPLE_FPS: ${{ inputs.sample_fps || '4' }}
       MAX_CLIPS: ${{ inputs.max_clips || '6' }}
     steps:
@@ -46,6 +48,15 @@ jobs:
 
       - name: Install Python deps
         run: pip install -r requirements.txt
+
+      - name: Pull new sessions from Google Drive
+        continue-on-error: true
+        run: |
+          if [ -n "$DRIVE_PARENT_FOLDER_ID" ]; then
+            python3 drive_sync.py sync
+          else
+            echo "Drive not configured, skipping (upload straight to R2 instead)"
+          fi
 
       - name: Find pending sessions
         id: find
@@ -88,9 +99,16 @@ jobs:
               echo "analyze failed"; FAILED="$FAILED $SESSION"; echo "::endgroup::"; continue
             fi
 
+            # master editor designs the edit; falls back internally if it fails
+            python3 editor_agent.py --analysis work/moments.json \
+              --out work/edl.json --style hype --target-clips "$MAX_CLIPS" $CTX || true
+
+            EDL=""
+            [ -f work/edl.json ] && EDL="--edl work/edl.json"
+
             if ! python3 reel_editor.py --video work/combined.mp4 \
                  --analysis work/moments.json --out work/reel.mp4 \
-                 --max-clips "$MAX_CLIPS" --no-captions; then
+                 --max-clips "$MAX_CLIPS" --no-captions $EDL; then
               echo "edit failed"; FAILED="$FAILED $SESSION"; echo "::endgroup::"; continue
             fi
 

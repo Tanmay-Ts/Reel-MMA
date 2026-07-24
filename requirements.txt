@@ -6,3 +6,6 @@ openai>=1.40.0
 # R2 sync (r2_sync.py) and the future publish step:
 boto3>=1.34.0
 requests>=2.31.0
+# Google Drive intake (drive_sync.py):
+google-api-python-client>=2.100.0
+google-auth>=2.23.0
