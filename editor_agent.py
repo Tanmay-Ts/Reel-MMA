@@ -46,6 +46,77 @@ import sys
 TRANSITIONS = ["smoothleft", "smoothright", "slideleft", "slideup",
                "fade", "circleopen", "wiperight", "dissolve"]
 
+# Moments that belong at the END of a reel. A prize giving is the resolution of
+# an event, so it reads as an ending regardless of how it scored.
+CLOSING_TYPES = {"gift_presentation", "award", "ceremony", "medal",
+                 "team_photo", "trophy"}
+
+# Calm moments that carry feeling rather than action. They read over several
+# seconds and look broken when cut tight, so they get generous padding.
+ATMOSPHERE_TYPES = {"celebration", "crowd_reaction", "announcement",
+                    "handshake", "group_moment"} | CLOSING_TYPES
+
+
+def is_closing(m):
+    return str(m.get("action_type", "")).lower() in CLOSING_TYPES
+
+
+def is_atmosphere(m):
+    return str(m.get("action_type", "")).lower() in ATMOSPHERE_TYPES
+
+
+def arrange_narrative(clips, moments):
+    """Action first, then the occasion's ending.
+
+    Closing moments (prize giving, trophies, team photos) are moved to the end
+    and kept in the order they happened among themselves. Everything else keeps
+    the order the editor chose. This is what makes a reel feel like it finishes
+    rather than just stopping.
+    """
+    action = [c for c in clips if not is_closing(moments[c["index"]])]
+    closing = [c for c in clips if is_closing(moments[c["index"]])]
+    closing.sort(key=lambda c: _parse_ts(moments[c["index"]]["start_time"]))
+    if closing:
+        # the first clip after the action should settle, not whip-cut
+        closing[0]["transition"] = "fade"
+    return action + closing
+
+
+def top_up_to_minimum(clips, moments, min_duration, trans_dur=0.4):
+    """Add unused moments until the reel reaches min_duration.
+
+    The agent optimises for punchiness and will happily hand back 20 seconds.
+    When a minimum is asked for, this fills it deterministically rather than
+    hoping the model counts seconds correctly, which it does not.
+    """
+    def total(cs):
+        return sum(_dur(moments[c["index"]]) + c["pad_start"] + c["pad_end"]
+                   for cs_ in [cs] for c in cs_) - max(0, len(cs) - 1) * trans_dur
+
+    used = {c["index"] for c in clips}
+    spare = [i for i in range(len(moments)) if i not in used]
+    # best first, but atmosphere counts extra since it adds texture not repetition
+    spare.sort(key=lambda i: (float(moments[i].get("visual_score", 0) or 0)
+                              + (1.5 if is_atmosphere(moments[i]) else 0)),
+               reverse=True)
+
+    added = 0
+    for i in spare:
+        if total(clips) >= min_duration:
+            break
+        m = moments[i]
+        atmos = is_atmosphere(m)
+        clips.append({
+            "index": i,
+            "pad_start": 2.0 if atmos else 1.5,
+            "pad_end": 3.0 if atmos else 2.0,
+            "transition": "fade" if atmos else "smoothleft",
+            "reason": "added to reach the requested reel length",
+        })
+        added += 1
+    return clips, added, total(clips)
+
+
 CEREMONY_PROMPT = """\
 You are editing a CEREMONY reel: a medal presentation, belt promotion, awards, or
 prize giving. This is NOT a highlights reel and the usual rules are inverted.
@@ -115,8 +186,17 @@ Judge on these, in order:
    Never set pad_start below 1.0 or pad_end below 1.5. A clip that starts on the
    action already in progress looks broken.
 
-5. ENDING. Finish on something conclusive. A clean finish or the best technique.
-   Do not end on a weak or ambiguous clip.
+5. THE OCCASION'S ENDING. If the session contains a prize giving, trophy,
+   medals, or a team photo, those belong at the END of the reel, in the order
+   they happened. They are the resolution of the event. Never open with them.
+
+6. ATMOSPHERE IS NOT FILLER. Celebrations, cheering, announcements, huddles and
+   handshakes carry the feeling of the day. Include them alongside the action,
+   and give them longer clips than you would give a fast technique. They read
+   over several seconds and look broken when cut tight.
+
+7. ENDING. Finish on something conclusive. A clean finish, the best technique,
+   or the occasion's closing moment.
 
 You may DROP clips. A shorter reel of strong varied moments beats a longer one
 padded with repetition. You may also reorder freely; source order does not matter.
@@ -275,6 +355,9 @@ def main():
     ap.add_argument("--model", default="gpt-4o")
     ap.add_argument("--target-clips", type=int, default=6)
     ap.add_argument("--max-duration", type=float, default=60.0)
+    ap.add_argument("--min-duration", type=float, default=0.0,
+                    help="force the reel to at least this many seconds by "
+                         "adding more moments. 0 disables.")
     ap.add_argument("--style", default="hype", choices=list(STYLE_NOTES))
     ap.add_argument("--context", default=None)
     ap.add_argument("--context-file", default=None)
@@ -312,7 +395,11 @@ def main():
             f"Session moments:\n{summarise(moments)}\n\n"
             f"Target roughly {args.target_clips} clips, hard maximum "
             f"{args.max_duration:.0f} seconds total.\n"
-            f"Editing style: {args.style}. {STYLE_NOTES[args.style]}"
+            + (f"The reel MUST be at least {args.min_duration:.0f} seconds long. "
+               f"Include enough moments, and long enough clips, to reach that. "
+               f"Do not hand back a short punchy reel when a longer one is asked for.\n"
+               if args.min_duration else "")
+            + f"Editing style: {args.style}. {STYLE_NOTES[args.style]}"
         )
         if ceremony_mode:
             user = (
@@ -348,6 +435,17 @@ def main():
                else fallback_edl(moments, args.target_clips, args.max_duration))
         clips, problems = validate(edl, len(moments), cap, moments)
 
+    # Prize giving and team photos belong at the end, whatever the agent chose.
+    if not ceremony_mode:
+        clips = arrange_narrative(clips, moments)
+
+    added = 0
+    if args.min_duration and not ceremony_mode:
+        clips, added, _ = top_up_to_minimum(clips, moments, args.min_duration,
+                                            trans_dur=0.4)
+        if added:
+            clips = arrange_narrative(clips, moments)
+
     out = {"reasoning": str(edl.get("reasoning", ""))[:600], "clips": clips}
     with open(args.out, "w") as fh:
         json.dump(out, fh, indent=2, ensure_ascii=False)
@@ -365,7 +463,12 @@ def main():
               f"({m.get('action_type')}) {length:.1f}s  cut={cut}")
         if c["reason"]:
             print(f"       {c['reason']}")
+    if added:
+        print(f"  (+{added} moment(s) added to reach the {args.min_duration:.0f}s minimum)")
     print(f"\nApprox reel length: {total:.1f}s  ->  {args.out}")
+    if args.min_duration and total < args.min_duration:
+        print(f"  ! only {total:.1f}s; the session did not contain enough "
+              f"usable moments to reach {args.min_duration:.0f}s")
     for p in problems:
         print(f"  [repaired] {p}")
 

@@ -18,7 +18,11 @@ on:
       max_clips:
         description: "Max highlights per reel"
         required: false
-        default: "6"
+        default: "10"
+      min_duration:
+        description: "Minimum reel length in seconds"
+        required: false
+        default: "45"
 
 jobs:
   build:
@@ -33,7 +37,8 @@ jobs:
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       DRIVE_PARENT_FOLDER_ID: ${{ secrets.DRIVE_PARENT_FOLDER_ID }}
       SAMPLE_FPS: ${{ inputs.sample_fps || '4' }}
-      MAX_CLIPS: ${{ inputs.max_clips || '6' }}
+      MAX_CLIPS: ${{ inputs.max_clips || '10' }}
+      MIN_DURATION: ${{ inputs.min_duration || '45' }}
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
@@ -101,7 +106,8 @@ jobs:
 
             # master editor designs the edit; falls back internally if it fails
             python3 editor_agent.py --analysis work/moments.json \
-              --out work/edl.json --style hype --target-clips "$MAX_CLIPS" $CTX || true
+              --out work/edl.json --style hype --target-clips "$MAX_CLIPS" \
+              --min-duration "$MIN_DURATION" --max-duration 90 $CTX || true
 
             EDL=""
             [ -f work/edl.json ] && EDL="--edl work/edl.json"

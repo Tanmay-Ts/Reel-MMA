@@ -180,6 +180,36 @@ empty list rather than inventing something.
 }
 
 
+ATMOSPHERE_BLOCK = """\
+
+ALWAYS ALSO CAPTURE THE OCCASION ITSELF, in every kind of footage.
+
+A reel is not only the action. The moments around it are what make it feel like
+an event, and they are easy to miss because they are not explosive. Report these
+whenever you see them, even though they are calm:
+
+- celebrations after a score, finish, or win: arms raised, hugs, jumping, team pile-ons
+- cheering, clapping, and reacting crowds or teammates on the sideline
+- team announcements, huddles, line-ups, name calling, coach addressing the group
+- gift giving, prize handing, trophies, medals, certificates, belts
+- handshakes, bows, respect between opponents, helping someone up
+- team photos, group shots, everyone gathered together
+- expressive faces: joy, relief, exhaustion, determination
+
+Use these action_type values for them: celebration, crowd_reaction, announcement,
+gift_presentation, award, handshake, team_photo, group_moment.
+
+Judge these on HUMAN FEELING made visible, not on physical intensity. A team
+erupting after a goal is highlight-worthy even though nobody is moving fast. A
+trophy being handed over is highlight-worthy even though it is slow and quiet.
+Score them on how much emotion is legible in the frame.
+
+For these moments give a GENEROUS time window. They need room to breathe and
+they read over several seconds, unlike a takedown which resolves in one. Do not
+clip them tight.
+"""
+
+
 def build_prompt(primary, also_present=None):
     """Compose the analyst prompt for the detected activity or activities."""
     profile = ACTIVITY_PROFILES.get(primary, ACTIVITY_PROFILES["generic"])
@@ -198,7 +228,7 @@ def build_prompt(primary, also_present=None):
         for a in extras:
             prompt += "\n" + ACTIVITY_PROFILES[a]["brief"]
 
-    return prompt + "\n" + SHARED_SCHEMA
+    return prompt + ATMOSPHERE_BLOCK + "\n" + SHARED_SCHEMA
 
 
 DETECT_PROMPT = """\
